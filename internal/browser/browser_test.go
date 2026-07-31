@@ -928,3 +928,36 @@ func TestBrowserFindElementByCSS_PseudoSelector(t *testing.T) {
 		t.Error("card:first-child screenshot returned empty data")
 	}
 }
+
+func TestBrowser_DoubleClose_DoesNotPanic(t *testing.T) {
+	// Create a separate browser instance for this test (not the shared testBrowser)
+	cfg := config.BrowserConfig{
+		Headless:  true,
+		NoSandbox: true,
+	}
+	b, err := New(cfg)
+	if err != nil {
+		t.Fatalf("failed to create browser: %v", err)
+	}
+
+	ctx := context.Background()
+	if err := b.Launch(ctx); err != nil {
+		t.Fatalf("failed to launch browser: %v", err)
+	}
+
+	// Create a page so the browser is fully initialized
+	if err := b.NewPage(ctx, testFixtureURL+"/test_fixture.html"); err != nil {
+		t.Fatalf("failed to create page: %v", err)
+	}
+
+	// First close should succeed
+	if err := b.Close(); err != nil {
+		t.Logf("first Close() error (may be expected if browser exited): %v", err)
+	}
+
+	// Second close should NOT panic — this is the regression test
+	// Close() must be idempotent and handle already-nil resources gracefully
+	if err := b.Close(); err != nil {
+		t.Logf("second Close() error (expected to be nil or benign): %v", err)
+	}
+}
