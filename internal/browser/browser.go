@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -53,6 +54,11 @@ type Browser struct {
 
 	// Recording session (nil when not recording)
 	recording *RecordingSession
+
+	// Browser process lifecycle
+	browserPID  int
+	closing     bool // set by Close() so the monitor stays quiet on intentional shutdown
+	monitorStop chan struct{}
 }
 
 // ConsoleMessage represents a browser console message.
@@ -172,6 +178,19 @@ func (b *Browser) Launch(ctx context.Context) error {
 		l = l.UserDataDir(userDataDir)
 	}
 
+	// Reclaim the profile before handing it to a new browser process. ATR does
+	// not track or reap the browser process today: if the daemon is killed
+	// (SIGKILL, panic, tooling) the browser is reparented to launchd and keeps
+	// holding this user-data-dir. Two browser processes sharing one profile is
+	// a known corruption vector, and Chrome's crash-recovery startup path
+	// (profile.exit_type="Crashed") is less exercised than normal startup.
+	if userDataDir != "" {
+		if err := reclaimProfile(userDataDir); err != nil {
+			// Profile hygiene must never block a launch; surface it and continue.
+			log.Printf("[browser] profile reclaim for %s: %v", userDataDir, err)
+		}
+	}
+
 	// Set headless mode
 	l = l.Headless(b.config.Headless)
 
@@ -199,6 +218,12 @@ func (b *Browser) Launch(ctx context.Context) error {
 	// Store the control URL for external access (e.g., MCP servers)
 	b.controlURL = controlURL
 
+	// Track the browser process so shutdown, the next launch, and the crash
+	// monitor can all guarantee it does not outlive us.
+	b.browserPID = l.PID()
+	b.closing = false
+	b.startProcessMonitor()
+
 	// Connect to browser
 	browser := rod.New().ControlURL(controlURL)
 	if b.config.SlowMotion > 0 {
@@ -224,6 +249,49 @@ func (b *Browser) Launch(ctx context.Context) error {
 	b.startTargetListener()
 
 	return nil
+}
+
+// startProcessMonitor watches the browser process and emits an explicit
+// diagnostic when it dies without ATR asking it to. Today a browser crash is
+// entirely silent to ATR's own logs.
+func (b *Browser) startProcessMonitor() {
+	pid := b.browserPID
+	if !processTrackingSupported || pid <= 0 {
+		return
+	}
+	// Stop any previous monitor before replacing it -- guards against a
+	// leaked goroutine if Launch() is ever called twice without an
+	// intervening Close().
+	if b.monitorStop != nil {
+		close(b.monitorStop)
+	}
+	stop := make(chan struct{})
+	b.monitorStop = stop
+
+	go func() {
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+				if processAlive(pid) {
+					continue
+				}
+				b.mu.RLock()
+				intentional := b.closing
+				b.mu.RUnlock()
+				if intentional {
+					return
+				}
+				log.Printf("[browser] browser process pid=%d exited unexpectedly "+
+					"(no shutdown was requested); look for a crash report in "+
+					"~/Library/Logs/DiagnosticReports/", pid)
+				return
+			}
+		}
+	}()
 }
 
 // maximizeWindow maximizes the browser window via CDP.
@@ -519,7 +587,20 @@ func (b *Browser) Close() error {
 	}
 
 	b.mu.Lock()
-	defer b.mu.Unlock()
+	unlocked := false
+	unlock := func() {
+		if !unlocked {
+			unlocked = true
+			b.mu.Unlock()
+		}
+	}
+	defer unlock()
+
+	b.closing = true
+	if b.monitorStop != nil {
+		close(b.monitorStop)
+		b.monitorStop = nil
+	}
 
 	if b.browser == nil {
 		return nil
@@ -534,8 +615,39 @@ func (b *Browser) Close() error {
 		return nil
 	}
 
-	// The target listener goroutine will naturally stop when browser is closed
-	return b.browser.Close()
+	// The target listener goroutine will naturally stop when browser is closed.
+	// Release the lock before the slow post-close verification below so other
+	// Browser methods aren't blocked for its duration.
+	pid := b.browserPID
+	b.browserPID = 0
+	browser := b.browser
+	b.browser = nil
+	unlock()
+
+	closeErr := browser.Close()
+
+	// b.browser.Close() is a CDP request. If the browser is wedged it fails or
+	// hangs and the process survives as an orphan holding the profile. Verify
+	// it is actually gone.
+	//
+	// Note: we deliberately do NOT call the go-rod launcher's Cleanup() here.
+	// In go-rod v0.116.2, Cleanup() unconditionally os.RemoveAll()s the
+	// configured UserDataDir once the process exits -- that would delete the
+	// user's persisted session (e.g. ~/.atr/opal-session, including Duo/Okta
+	// cookies) on every clean shutdown, which is the opposite of what
+	// --persist-session promises. Not calling it is also the pre-existing
+	// behavior for any UserDataDir-configured launch.
+	if processTrackingSupported && pid > 0 {
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) && processAlive(pid) {
+			time.Sleep(100 * time.Millisecond)
+		}
+		if processAlive(pid) {
+			log.Printf("[browser] pid=%d survived CDP close; force-terminating", pid)
+			killProcessTree(pid)
+		}
+	}
+	return closeErr
 }
 
 // NewPage creates a new page/tab and navigates to the URL.
