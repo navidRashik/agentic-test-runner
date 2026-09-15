@@ -25,11 +25,9 @@ go.work
 go.work.sum
 
 # env file
-.env
 
 # Editor/IDE
 .idea/
-.vscode/
 .gemini/
 .CodeEagle/
 .CodeEagle.conf
@@ -37,3 +35,5 @@ go.work.sum
 # build output
 bin/
 atr
+config.bat
+node_modules
